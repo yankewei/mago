@@ -1,8 +1,12 @@
+use std::env;
 use std::env::consts::ARCH;
 use std::env::consts::OS;
 use std::fs;
 use std::io::BufRead;
 use std::io::Write;
+use std::path::Component;
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -115,6 +119,11 @@ pub fn execute(command: SelfUpdateCommand) -> Result<ExitCode, Error> {
                 }
             }
         });
+    }
+
+    if is_homebrew_install() {
+        warn!("Homebrew installations can't self-update; run `brew upgrade mago` instead");
+        return Ok(ExitCode::FAILURE);
     }
 
     let status = perform_update(release_update)?;
@@ -232,4 +241,79 @@ fn get_target_asset_from_release(release: &Release) -> Result<&ReleaseAsset, Err
         .ok_or_else(|| {
             Error::SelfUpdate(SelfUpdateError::Release("No asset found for the current platform.".to_string()))
         })
+}
+
+fn is_homebrew_install() -> bool {
+    let exe_path = match env::current_exe() {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+
+    let mut candidate_paths = vec![exe_path.clone()];
+    if let Ok(canonical) = exe_path.canonicalize() {
+        candidate_paths.push(canonical);
+    }
+
+    let mut homebrew_roots = Vec::new();
+    for var in ["HOMEBREW_PREFIX", "HOMEBREW_CELLAR", "HOMEBREW_REPOSITORY"] {
+        if let Some(value) = env::var_os(var) {
+            let path = PathBuf::from(&value);
+            if !path.as_os_str().is_empty() {
+                if let Ok(canonical) = path.canonicalize() {
+                    homebrew_roots.push(canonical);
+                }
+                homebrew_roots.push(path);
+            }
+        }
+    }
+
+    detect_homebrew_install(&candidate_paths, &homebrew_roots)
+}
+
+fn detect_homebrew_install(paths: &[PathBuf], brew_roots: &[PathBuf]) -> bool {
+    paths.iter().any(|path| {
+        is_homebrew_cellar_path(path)
+            || brew_roots.iter().any(|root| !root.as_os_str().is_empty() && path.starts_with(root))
+    })
+}
+
+fn is_homebrew_cellar_path(path: &Path) -> bool {
+    let components = path.components().filter_map(|component| match component {
+        Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+        _ => None,
+    });
+
+    let mut previous: Option<String> = None;
+    for component in components {
+        if previous.as_deref() == Some("Cellar") && (component == "mago" || component.starts_with("mago@")) {
+            return true;
+        }
+        previous = Some(component);
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_direct_cellar_install() {
+        let path = PathBuf::from("/opt/homebrew/Cellar/mago/1.0.0/bin/mago");
+        assert!(detect_homebrew_install(&[path], &[]));
+    }
+
+    #[test]
+    fn detects_symlinked_homebrew_install() {
+        let link_path = PathBuf::from("/opt/homebrew/bin/mago");
+        let canonical = PathBuf::from("/opt/homebrew/Cellar/mago/1.0.0/bin/mago");
+        assert!(detect_homebrew_install(&[link_path, canonical], &[PathBuf::from("/opt/homebrew")]));
+    }
+
+    #[test]
+    fn ignores_non_homebrew_path() {
+        let path = PathBuf::from("/usr/local/bin/mago");
+        assert!(!detect_homebrew_install(&[path], &[]));
+    }
 }
